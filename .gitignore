@@ -43,3 +43,10 @@ data/*
 # IDE
 .vscode/
 .idea/
+
+
+# Dont include personal notes and results
+personal_notes
+personal_notes/*
+results
+results/*
