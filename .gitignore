@@ -29,7 +29,8 @@ env.bak
 venv.bak
 
 # Data and Results (Large/Auto-generated files)
-data/
+data/*
+!data/README.md
 results/
 *.tsv
 *.bin
