@@ -31,7 +31,6 @@ venv.bak
 # Data and Results (Large/Auto-generated files)
 data/*
 !data/README.md
-results/
 *.tsv
 *.bin
 *.gz
