@@ -1,0 +1,687 @@
+\documentclass[11pt,letterpaper]{article}
+
+% ── packages ──────────────────────────────────────────────────────────────────
+\usepackage[margin=1in]{geometry}
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{enumitem}
+\usepackage{float}
+\usepackage{microtype}
+\usepackage[numbers,sort&compress]{natbib}
+
+\hypersetup{colorlinks=true, linkcolor=blue!70!black,
+            citecolor=blue!70!black, urlcolor=blue!70!black}
+\captionsetup{font=small, labelfont=bf}
+\setlength{\parskip}{4pt}
+
+% ── title ─────────────────────────────────────────────────────────────────────
+\title{%
+  \Large\textbf{Cancer Subtype Discovery and Classification}\\[4pt]
+  \large from TCGA Pan-Cancer Gene Expression Data\\[6pt]
+  \normalsize 02-620 Machine Learning for Scientists --- Spring 2026
+}
+\author{Tolga Ozgun \and Yuchen Shao \and Roy Hung}
+\date{April 2026}
+
+\begin{document}
+\maketitle
+
+% ─────────────────────────────────────────────────────────────────────────────
+\begin{abstract}
+We present an end-to-end machine learning pipeline for cancer subtype
+discovery and classification applied to bulk RNA-seq data from The Cancer
+Genome Atlas (TCGA) Pan-Cancer dataset.  Starting from raw HTSeq-FPKM-UQ
+expression matrices across six cancer types (BRCA, LUAD, KIRC, PRAD, COAD,
+GBM), we implement three methods entirely from scratch: (1)~unsupervised
+clustering via PCA + K-Means, (2)~supervised one-vs-rest logistic regression
+with $\ell_2$-regularisation, and (3)~a multi-layer perceptron (MLP) in
+PyTorch.  All supervised models are evaluated using 5-fold stratified
+cross-validation with preprocessing fit inside each fold to prevent data
+leakage.  K-Means achieves ARI\,=\,0.794, NMI\,=\,0.849; logistic regression
+reaches macro-F1\,=\,0.9927 and the MLP reaches macro-F1\,=\,0.9981
+(5-fold CV: $0.9983 \pm 0.0010$) on the held-out test set.  Motivated by TA
+feedback, we extend the pipeline with biological validation via feature
+importance analysis: LR weights are projected from PCA space back to gene
+space, revealing well-established tissue-specific markers (e.g., NKX2-1/TTF-1
+for LUAD, PCA3 for PRAD, GATA3 for BRCA) as the top discriminative genes.
+MLP permutation importance confirms that the first eight principal components
+together account for the vast majority of classification signal, with a sharp
+drop-off thereafter.  These findings confirm that the models learn biologically
+meaningful signals rather than technical artefacts.
+\end{abstract}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Introduction}
+\label{sec:intro}
+
+Cancer is not a single disease.  Even within the same organ, tumours can differ
+dramatically in molecular profile, prognosis, and response to therapy.  Bulk
+RNA-sequencing captures a genome-wide snapshot of gene expression in a tumour
+sample, providing a high-dimensional view of its molecular state.  The
+challenge we address is threefold:
+
+\begin{enumerate}[leftmargin=2em,itemsep=1pt]
+  \item \textbf{Unsupervised discovery.}  Can meaningful cancer subtypes be
+        recovered from unlabelled gene expression data using PCA followed by
+        K-Means clustering?
+  \item \textbf{Linear classification.}  How accurately can a multi-class
+        logistic regression model predict cancer type from PCA-reduced features?
+  \item \textbf{Non-linear classification.}  Does a deep neural network offer
+        a measurable gain over the linear baseline?
+\end{enumerate}
+
+A fourth question --- raised during TA review --- drives the extension in
+Section~\ref{sec:importance}:
+
+\begin{enumerate}[leftmargin=2em,itemsep=1pt]
+  \setcounter{enumi}{3}
+  \item \textbf{Biological validity.}  Do the models learn tissue-specific gene
+        expression signatures, or could the high accuracy reflect technical
+        batch structure that survived normalisation?
+\end{enumerate}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Dataset}
+\label{sec:dataset}
+
+\subsection{Source}
+
+We use the TCGA Pan-Cancer (PANCAN) gene expression dataset downloaded via the
+GDC Data Portal API\footnote{\url{https://portal.gdc.cancer.gov/}}.
+Specifically:
+
+\begin{itemize}[leftmargin=2em,itemsep=1pt]
+  \item \textbf{Expression matrix} (UUID
+        \texttt{3586c0da-64d0-4b74-a449-5ff4d9136611}):
+        HTSeq-FPKM-UQ values, batch-corrected with EBPlusPlus across all TCGA
+        projects.
+  \item \textbf{Clinical metadata} (UUID
+        \texttt{1b5f413e-a8d1-4d10-92eb-7c4ae739ed81}):
+        patient-level cancer type annotations from the TCGA Clinical Data
+        Resource.
+\end{itemize}
+
+\subsection{Cancer Types and Class Distribution}
+
+We focus on six cancer types spanning distinct tissue origins
+(Table~\ref{tab:dataset} and Figure~\ref{fig:class_dist}).
+
+\begin{table}[H]
+  \centering
+  \caption{Dataset composition after preprocessing.}
+  \label{tab:dataset}
+  \begin{tabular}{llr}
+    \toprule
+    Cancer Type & Abbreviation & Samples \\
+    \midrule
+    Breast Invasive Carcinoma         & BRCA & 1{,}215 \\
+    Kidney Renal Clear Cell Carcinoma & KIRC &   606 \\
+    Lung Adenocarcinoma               & LUAD &   576 \\
+    Prostate Adenocarcinoma           & PRAD &   550 \\
+    Colon Adenocarcinoma              & COAD &   492 \\
+    Glioblastoma Multiforme           & GBM  &   168 \\
+    \midrule
+    \textbf{Total}                    &      & \textbf{3,607} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.72\textwidth]{../results/runs/run_20260419_175643/graphs/fig01_class_distribution.png}
+  \caption{Sample count per cancer type.  BRCA is the largest class (1,215
+           samples) and GBM the smallest (168 samples), introducing mild class
+           imbalance addressed by macro-averaged metrics.}
+  \label{fig:class_dist}
+\end{figure}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Data Preprocessing}
+\label{sec:preprocessing}
+
+\paragraph{Loading and filtering.}
+We first read only the header of the 1.8\,GB TSV to identify columns matching
+our six cancer types, then load only those columns --- reducing I/O substantially.
+
+\paragraph{Log-transformation and NaN handling.}
+Raw FPKM-UQ values are $\log_2(x+1)$ transformed to stabilise variance.
+Missing values are filled with 0.
+
+\paragraph{Variance filtering.}
+Genes with variance $<10^{-6}$ are removed, leaving \textbf{20,297 gene
+features}.
+
+\paragraph{Train / test split.}
+15\% of samples are held out as a final test set via stratified random
+splitting (seed 42):
+\begin{itemize}[leftmargin=2em,itemsep=0pt]
+  \item Development set: 3,065 samples (85\%)
+  \item Test set (held out): 542 samples (15\%)
+\end{itemize}
+
+\paragraph{Standardisation and PCA.}
+A single \texttt{StandardScaler} and PCA (50 components) are fit on the
+development set and applied to the test set.  For cross-validation, both
+transformers are re-fit inside each fold's training partition only, so no
+information from the validation partition influences the fitted transformers
+(preventing data leakage).
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Methodology and Implementation}
+\label{sec:methodology}
+
+All three ML methods are implemented from scratch in NumPy (Methods 1 \& 2)
+or PyTorch (Method 3).  Scikit-learn is used only for evaluation metrics,
+data splitting, and preprocessing utilities.
+
+\subsection{Method 1: PCA + K-Means Clustering}
+
+\paragraph{PCA.}
+We implement PCA via truncated SVD: given centered data
+$\mathbf{X} \in \mathbb{R}^{n \times p}$, we compute
+$\mathbf{X} = \mathbf{U}\mathbf{S}\mathbf{V}^\top$ and retain the top $k=50$
+right singular vectors.  Explained variance ratios are computed as
+$r_i = \lambda_i / \sum_j \lambda_j$ where $\lambda_i = s_i^2 / (n-1)$, with
+the denominator summed over \emph{all} components so the ratios are properly
+normalised.  The top 50 PCs capture \textbf{63.7\%} of total variance.
+
+\paragraph{K-Means.}
+Lloyd's algorithm with $k{=}6$, $n\_\text{init}{=}10$ random restarts, and
+convergence tolerance $10^{-4}$.  After convergence, labels are re-assigned
+using the final centroids before computing inertia (correcting a subtle bug
+where labels could refer to pre-update centroids).
+
+\subsection{Method 2: Logistic Regression (One-vs-Rest)}
+
+We train $C=6$ binary logistic classifiers with $\ell_2$-regularised
+cross-entropy loss:
+
+\begin{equation}
+  \mathcal{L}(\mathbf{w}, b) =
+    -\frac{1}{n}\sum_{i=1}^n \Bigl[\tilde{y}_i \log \hat{y}_i +
+      (1-\tilde{y}_i)\log(1-\hat{y}_i)\Bigr]
+    + \frac{\lambda}{2n} \|\mathbf{w}\|_2^2
+\end{equation}
+
+Training uses gradient descent with $\eta{=}0.1$ for 1,000 iterations.
+Hyperparameter search over $\lambda \in \{0.001, 0.01, 0.1\}$ is performed via
+5-fold stratified CV, with preprocessing fit inside each fold.
+
+\subsection{Method 3: Multi-Layer Perceptron (MLP)}
+
+Feedforward network implemented in PyTorch:
+\begin{equation*}
+  \underbrace{50}_{\text{input}} \to
+  \underbrace{512}_{\text{Linear+ReLU+BN+Dropout}} \to
+  \underbrace{256}_{\text{Linear+ReLU+BN+Dropout}} \to
+  \underbrace{6}_{\text{output}}
+\end{equation*}
+Trained with Adam ($\eta{=}0.001$), batch size 64, 50 epochs,
+\texttt{CrossEntropyLoss}.  Evaluated with the same 5-fold CV framework as
+the LR model.  To ensure reproducibility and prevent any form of test-set
+influence during final training, a fixed random seed (\texttt{torch.manual\_seed(42)})
+is set before each training run, and a 10\% monitor split is carved from the
+development set for early-stopping diagnostics (the test set is never used
+as a validation signal).
+
+\subsection{Evaluation Metrics}
+
+\textbf{Clustering:} ARI, NMI, Silhouette score.
+\textbf{Classification:} Macro-averaged F1, Precision, Recall; per-class
+confusion matrix; 5-fold CV mean $\pm$ std F1.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Results}
+\label{sec:results}
+
+\subsection{PCA Analysis}
+
+The top 50 PCs explain 63.7\% of total variance
+(Figure~\ref{fig:pca_variance}).  The scree plot shows a characteristic
+elbow around PC~8--10; subsequent components each contribute $<0.5\%$.
+Even in two dimensions (Figure~\ref{fig:pca_labels}), the six cancer types
+form largely non-overlapping clusters --- a strong indicator that supervised
+classification will be straightforward.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\textwidth]{../results/runs/run_20260419_175643/graphs/fig02_pca_variance.png}
+  \caption{PCA explained variance on the development set.
+           \textit{Left:} per-component variance (scree plot).
+           \textit{Right:} cumulative variance; the dashed line marks the
+           63.7\% explained by the top 50 components.}
+  \label{fig:pca_variance}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.72\textwidth]{../results/runs/run_20260419_175643/graphs/fig03_pca_true_labels.png}
+  \caption{PCA projection (PC1 vs PC2) coloured by true cancer type.  Even
+           in two dimensions, the six cancer types are largely separable.}
+  \label{fig:pca_labels}
+\end{figure}
+
+\subsection{Method 1: Unsupervised Clustering}
+
+\begin{table}[H]
+  \centering
+  \caption{K-Means clustering evaluation (development set).}
+  \label{tab:clustering}
+  \begin{tabular}{lr}
+    \toprule
+    Metric & Score \\
+    \midrule
+    Adjusted Rand Index (ARI)        & 0.794 \\
+    Normalised Mutual Information (NMI) & 0.849 \\
+    Silhouette Score                 & 0.228 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+ARI\,=\,0.794 indicates strong unsupervised recovery of the true partitioning.
+The Silhouette score (0.228) is consistent with published results on
+high-dimensional transcriptomic data: TCGA bulk RNA-seq studies routinely
+report Silhouette values in the 0.15--0.35 range even for well-validated
+subtypes~\cite{weinstein2013}, because within-cluster geometric variance in
+50-D PCA space is inherently large.  ARI and NMI are more informative here as
+they measure agreement with known labels directly.
+
+Figure~\ref{fig:kmeans} shows that five of the six clusters align almost
+exclusively with a single cancer type.  GBM (168 samples, the smallest class)
+is the primary source of residual confusion: at this sample size it cannot
+reliably form a well-separated centroid in PCA space, and its cluster partially
+overlaps neighbouring tissue types.  The cluster purity heatmap
+(Figure~\ref{fig:purity}) confirms that BRCA, COAD, KIRC, LUAD, and PRAD each
+map cleanly to dedicated clusters.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\textwidth]{../results/runs/run_20260419_175643/graphs/fig04_kmeans_vs_truth.png}
+  \caption{\textit{Left:} samples coloured by true cancer type.
+           \textit{Right:} K-Means cluster assignments; crosses mark centroids.
+           The panels are visually similar, confirming ARI\,=\,0.794.}
+  \label{fig:kmeans}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.72\textwidth]{../results/runs/run_20260419_175643/graphs/fig05_cluster_purity.png}
+  \caption{Cluster purity heatmap.  Colours encode the proportion of each
+           cluster belonging to each cancer type; cell numbers show raw
+           counts.}
+  \label{fig:purity}
+\end{figure}
+
+\subsection{Methods 2 \& 3: Supervised Classification}
+
+\paragraph{Cross-validation.}
+Figure~\ref{fig:cv_folds} shows per-fold macro-F1.  LR achieves
+$0.9968 \pm 0.0027$ and MLP achieves $0.9983 \pm 0.0010$ --- both
+remarkably stable across folds, with MLP showing lower variance.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.75\textwidth]{../results/runs/run_20260419_175643/graphs/fig06_cv_folds.png}
+  \caption{5-fold CV macro-F1.  Dashed lines show cross-fold means.}
+  \label{fig:cv_folds}
+\end{figure}
+
+\paragraph{Test set evaluation.}
+Table~\ref{tab:classification} summarises test-set performance.
+Confusion matrices (Figures~\ref{fig:lr_cm} and~\ref{fig:mlp_eval}) and
+per-class F1 (Figure~\ref{fig:perclass}) show near-perfect classification
+for all cancer types.  Under LR, GBM is the only class with a slightly lower
+F1 (0.96); the MLP resolves most of these boundary cases, achieving near-perfect
+classification across all six types.
+
+\begin{table}[H]
+  \centering
+  \caption{Test set results (542 samples, 15\% hold-out).
+           LR hyperparameter: $\lambda{=}0.001$.}
+  \label{tab:classification}
+  \begin{tabular}{lcccc}
+    \toprule
+    Model & CV F1 (mean $\pm$ std) & Test F1 & Test Precision & Test Recall \\
+    \midrule
+    Logistic Regression & $0.9968 \pm 0.0027$ & 0.9927 & 0.9877 & 0.9982 \\
+    MLP [512, 256]      & $0.9983 \pm 0.0010$ & 0.9981 & 0.9981 & 0.9982 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.62\textwidth]{../results/runs/run_20260419_175643/graphs/fig07_lr_confusion.png}
+  \caption{Logistic Regression confusion matrix on the held-out test set.}
+  \label{fig:lr_cm}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.72\textwidth]{../results/runs/run_20260419_175643/graphs/fig08_mlp_learning_curves.png}
+  \caption{MLP training dynamics.  Loss decreases smoothly; validation
+           accuracy converges to $\approx$99.8\% within $\sim$20 epochs.}
+  \label{fig:mlp_curves}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.62\textwidth]{../results/runs/run_20260419_175643/graphs/fig09_mlp_confusion.png}
+  \caption{MLP confusion matrix on the held-out test set.}
+  \label{fig:mlp_eval}
+\end{figure}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=0.78\textwidth]{../results/runs/run_20260419_175643/graphs/fig10_perclass_f1.png}
+  \caption{Per-class F1 on the test set.  GBM is the only class where LR
+           makes errors; the MLP substantially reduces this gap, achieving
+           near-perfect classification across all classes.}
+  \label{fig:perclass}
+\end{figure}
+
+The MLP achieves test macro-F1\,=\,0.9981, a 0.54 percentage point gain over
+LR (0.9927).  This advantage is also visible in CV: the MLP's cross-validation
+standard deviation is nearly three times smaller ($0.0010$ vs $0.0027$),
+indicating more consistent generalisation.  The consistent advantage over LR
+across runs suggests a mild non-linear benefit at class boundaries, most likely
+at the BRCA--PRAD interface visible in Figure~\ref{fig:pca_labels}.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Biological Validation via Feature Importance}
+\label{sec:importance}
+
+\emph{This section was added in response to TA feedback, which noted that
+high classification accuracy alone does not rule out the possibility that
+models are exploiting residual technical batch structure.  Feature importance
+analysis provides a mechanism-level check: if the top discriminative genes are
+known tissue-specific markers, the models are learning biology.}
+
+\subsection{LR: Projecting Weights to Gene Space}
+
+Each OvR logistic regression classifier produces a weight vector
+$\mathbf{w}_c \in \mathbb{R}^{50}$ in PCA space.  We project these weights
+back to gene space via:
+\begin{equation}
+  \tilde{\mathbf{w}}_c = \mathbf{V}_k^\top \mathbf{w}_c
+  \quad \in \mathbb{R}^{20{,}297}
+\end{equation}
+where $\mathbf{V}_k \in \mathbb{R}^{20{,}297 \times 50}$ is the matrix of
+PCA loading vectors.  The resulting $\tilde{\mathbf{w}}_c$ assigns a
+discriminative score to every gene for class $c$, with sign indicating whether
+the gene is positively (higher in this cancer type) or negatively associated.
+
+Figure~\ref{fig:lr_genes} shows the top 15 genes per cancer type.
+Table~\ref{tab:top_genes} lists the top 5 for each class and their biological
+interpretation.
+
+\begin{table}[H]
+  \centering
+  \caption{Top 5 discriminative genes per cancer type from LR weight
+           projection, with known biological roles.}
+  \label{tab:top_genes}
+  \small
+  \begin{tabular}{llp{7cm}}
+    \toprule
+    Cancer & Top genes & Biological relevance \\
+    \midrule
+    BRCA & THRSP, SCGB2A2, ADIPOQ, LMX1B, GATA3
+         & GATA3 is a master transcription factor for luminal breast cancer
+           identity~\cite{cimino2013}; SCGB2A2 (Mammaglobin) is a
+           clinically used breast tissue-specific biomarker. \\[3pt]
+    COAD & LY6G6D, C13orf18, TDGF3, FAM55A, NAT2
+         & NAT2 (N-acetyltransferase 2) is highly expressed in colon
+           epithelium and is a known colorectal cancer susceptibility gene. \\[3pt]
+    GBM  & C21orf131, C2orf80, LOC643387, LOC285370, BTBD17
+         & Top genes include uncharacterised loci and brain-enriched transcripts.
+           GBM's smaller sample size (168 samples) reduces reliability of
+           individual gene estimates relative to the larger cohorts. \\[3pt]
+    KIRC & SLC22A2, AGXT2, SLC17A1, SLC5A10, SLC17A3
+         & SLC22A2 (OCT2) is expressed in kidney proximal tubule cells, the
+           cell of origin for clear cell RCC; the other top genes are also
+           solute carrier transporters with kidney-restricted expression. \\[3pt]
+    LUAD & SFTA3, SFTPA1, NKX2-1, SCGB3A2, SFTPB
+         & NKX2-1 (TTF-1) is the canonical lung adenocarcinoma marker used
+           clinically to confirm primary lung origin; SFTPA1 and SFTPB encode
+           pulmonary surfactant proteins produced by type II pneumocytes. \\[3pt]
+    PRAD & SLC45A3, PCA3, POTEG, BEND4, LMAN1L
+         & PCA3 is a prostate-specific non-coding RNA that is FDA-cleared
+           as a urine biomarker for prostate cancer detection; SLC45A3 is a
+           prostate-restricted androgen-regulated transporter. \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\textwidth]{../results/runs/run_20260419_175643/graphs/fig11_lr_gene_importance.png}
+  \caption{Top 15 discriminative genes per cancer type from LR weights
+           projected to gene space.  Red bars indicate genes positively
+           associated with each cancer type; blue bars indicate genes
+           negatively associated.}
+  \label{fig:lr_genes}
+\end{figure}
+
+The biological coherence of the recovered genes is strong: five of the six
+cancer types yield multiple well-established clinical markers in their top 5
+(NKX2-1/TTF-1 for LUAD, PCA3 for PRAD, GATA3 and Mammaglobin for BRCA, OCT2
+and related transporters for KIRC).  This confirms that the classifiers are
+responding to genuine tissue-of-origin expression signatures rather than
+technical batch structure.
+
+\subsection{PC Loadings: What Do the Principal Components Capture?}
+
+Figure~\ref{fig:pc_loadings} shows the top-loading genes for PC1 and PC2 ---
+the two axes that already visually separate the cancer types in the PCA scatter
+plot.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\textwidth]{../results/runs/run_20260419_175643/graphs/fig12_pc_loadings.png}
+  \caption{Top 15 genes by absolute loading magnitude for PC1 (left) and PC2
+           (right).  Red bars indicate positive loadings; blue bars negative.}
+  \label{fig:pc_loadings}
+\end{figure}
+
+The PC loading analysis complements the LR gene importance: while LR weights
+reflect the classifier's discriminative strategy for each class, PC loadings
+reveal what biological axes of variation the data itself is organised along,
+independent of any labels.
+
+\subsection{MLP Permutation Importance}
+
+For each of the 50 PCA dimensions, we permute that column in the test set
+(averaged over 3 repeats) and record the drop in macro-F1 relative to the
+unpermuted baseline.  A large drop indicates the model relies heavily on that
+dimension; near-zero drop indicates the dimension carries little discriminative
+signal for the MLP.
+
+\begin{figure}[H]
+  \centering
+  \includegraphics[width=\textwidth]{../results/runs/run_20260419_175643/graphs/fig13_mlp_permutation_importance.png}
+  \caption{MLP permutation importance: macro-F1 drop when each PC dimension
+           is permuted (sorted by importance; top 10 highlighted in red).}
+  \label{fig:perm_importance}
+\end{figure}
+
+The results (Table~\ref{tab:perm}) reveal a clear hierarchy: PC2 and PC1 are
+by far the most critical ($\Delta F1 = 0.1387$ and $0.0872$ respectively), with
+PC4, PC3, PC5, and PC6 each contributing modestly.  PCs 9 and beyond are nearly
+irrelevant for the MLP's predictions.  This is consistent with the PCA scatter
+plot (Figure~\ref{fig:pca_labels}), where most visual separation is already
+visible along the first two axes.
+
+\begin{table}[H]
+  \centering
+  \caption{Top 10 most important PCA dimensions for the MLP (permutation
+           importance, averaged over 3 shuffles per PC).}
+  \label{tab:perm}
+  \begin{tabular}{clr}
+    \toprule
+    Rank & PC & $\Delta$ Macro-F1 \\
+    \midrule
+    1  & PC2  & 0.1387 \\
+    2  & PC1  & 0.0872 \\
+    3  & PC4  & 0.0776 \\
+    4  & PC3  & 0.0405 \\
+    5  & PC5  & 0.0383 \\
+    6  & PC6  & 0.0374 \\
+    7  & PC9  & 0.0183 \\
+    8  & PC7  & 0.0154 \\
+    9  & PC11 & 0.0040 \\
+    10 & PC8  & 0.0020 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+The sharp drop-off after PC9 ($\Delta F1 < 0.01$) indicates that although
+we retain 50 components, the MLP effectively operates on fewer than 10
+dimensions.  This aligns with the scree plot (Figure~\ref{fig:pca_variance})
+where individual component variance becomes very small after the first dozen PCs.
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Analysis and Discussion}
+\label{sec:discussion}
+
+\subsection{Why Are Accuracies So High?}
+
+The near-perfect classification results ($>$99\% macro-F1) are consistent with
+the biology and prior literature:
+
+\begin{itemize}[leftmargin=2em,itemsep=2pt]
+  \item \textbf{Tissue-of-origin dominates expression.}  The six cancer types
+        originate from entirely different tissues.  Cancer largely preserves
+        tissue-specific transcriptional programmes~\cite{weinstein2013}, so the
+        discriminative signal is vastly larger than within-type heterogeneity.
+  \item \textbf{Batch correction.}  EBPlusPlus normalisation removes
+        sequencing artefacts; remaining variance is predominantly biological.
+  \item \textbf{Literature precedent.}  Published benchmarks on TCGA Pan-Cancer
+        classification report 90--99\% accuracy using RNA-seq
+        features~\cite{weinstein2013,hutter2018}.
+  \item \textbf{Feature importance validation.}  The top discriminative genes
+        (NKX2-1, PCA3, GATA3, SLC22A2, etc.) are established clinical markers,
+        confirming the model is learning biology (Section~\ref{sec:importance}).
+\end{itemize}
+
+\subsection{MLP vs.\ Logistic Regression}
+
+The MLP achieves a 0.54\,pp test-F1 advantage over LR and also shows lower
+cross-validation variance ($\pm 0.0010$ vs $\pm 0.0027$).  The PCA scatter
+plot (Figure~\ref{fig:pca_labels}) already shows clean two-dimensional
+separation; the MLP's non-linearity provides a minor benefit only at the
+finer class boundaries (e.g., BRCA/PRAD overlap in PC1).  Both CV and
+permutation importance confirm that the first few PCs carry the bulk of the
+discriminative signal, leaving limited room for non-linear models to exploit.
+
+\subsection{Unsupervised vs Supervised Performance}
+
+The ARI gap between K-Means (0.794) and supervised classifiers ($>0.99$) is
+expected: K-Means has no label information and must discover structure from
+geometry alone.  As shown in Figure~\ref{fig:purity}, five of the six clusters
+map cleanly to a single cancer type; residual confusion originates almost
+entirely from GBM's small and geometrically overlapping cluster.
+
+\subsection{Data Leakage Prevention}
+
+All \texttt{StandardScaler} and PCA fits are performed inside each CV fold's
+training partition only.  The test set is never seen until final evaluation,
+and the final MLP is trained using a dev-set monitor split (10\% of dev) rather
+than the test set for early stopping diagnostics.
+This ensures that the reported metrics faithfully estimate generalisation
+performance --- a critical design choice for high-dimensional genomic pipelines
+where leakage can produce misleadingly optimistic results.
+
+\subsection{Limitations}
+
+\begin{itemize}[leftmargin=2em,itemsep=1pt]
+  \item \textbf{GBM sample size.}  GBM's lower LR-F1 (0.96 vs 1.00 for all
+        other classes) traces directly to its 168-sample cohort ($7\times$
+        fewer than BRCA); future work could address this with data augmentation
+        or over-sampling strategies.
+  \item \textbf{Task difficulty.}  Classifying across tissue-of-origin is a
+        relatively easy task.  Harder problems (within-BRCA PAM50 subtypes,
+        survival prediction) would provide a more discriminating benchmark.
+  \item \textbf{Architecture search.}  The MLP architecture [512, 256] was
+        fixed; a systematic search could improve performance on harder tasks.
+  \item \textbf{Interpretability path.}  The current LR gene projection
+        ($\tilde{\mathbf{w}}_c = \mathbf{V}_k^\top \mathbf{w}_c$) identifies
+        top genes per class but does not account for gene--gene correlations.
+        Pathway-level enrichment analysis on the top gene lists (e.g.,
+        Gene Ontology or KEGG) would provide a richer biological interpretation
+        and is a natural next step.
+\end{itemize}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section{Conclusions}
+\label{sec:conclusions}
+
+We implemented and evaluated a complete machine learning pipeline for cancer
+type discovery and classification from TCGA Pan-Cancer RNA-seq data, and
+extended it with biological validation in response to TA feedback:
+
+\begin{enumerate}[leftmargin=2em,itemsep=2pt]
+  \item \textbf{PCA + K-Means} (unsupervised) recovers the six cancer types
+        with ARI\,=\,0.794 and NMI\,=\,0.849, demonstrating that bulk RNA-seq
+        contains strong tissue-of-origin structure independent of any
+        supervised signal.
+  \item \textbf{Logistic Regression} ($\ell_2$, OvR) achieves test
+        macro-F1\,=\,0.9927 (5-fold CV: $0.9968 \pm 0.0027$), confirming near
+        linear separability in 50-dimensional PCA space.
+  \item \textbf{MLP} [512, 256] achieves test macro-F1\,=\,0.9981 (5-fold CV:
+        $0.9983 \pm 0.0010$), a 0.54\,pp gain over LR with noticeably lower
+        cross-fold variance.  The CV estimate provides a conservative
+        generalisation bound consistent with the test-set result.
+  \item \textbf{Feature importance analysis} (LR weight projection, PC
+        loadings, MLP permutation importance) confirms that the models learn
+        established tissue-specific gene expression programmes rather than
+        technical artefacts: top discriminative genes include NKX2-1/TTF-1
+        (LUAD), PCA3 (PRAD), GATA3 and Mammaglobin (BRCA), and SLC22A2/OCT2
+        (KIRC) --- all clinically validated cancer biomarkers.
+\end{enumerate}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\section*{Implementation Notes}
+
+All code is available in the project repository.  Running
+\texttt{python src/main.py} from the project root regenerates all figures and
+analysis into a timestamped directory \texttt{results/runs/run\_YYYYMMDD\_HHMMSS/}.
+
+\begin{itemize}[leftmargin=2em,itemsep=0pt]
+  \item \texttt{src/data\_loader.py} --- GDC API download, log transform, variance filter
+  \item \texttt{src/pca.py} --- PCA via truncated SVD (NumPy)
+  \item \texttt{src/kmeans.py} --- Lloyd's K-Means with multiple restarts (NumPy)
+  \item \texttt{src/logistic\_regression.py} --- OvR LR with $\ell_2$ (NumPy)
+  \item \texttt{src/mlp.py} --- feedforward MLP (PyTorch)
+  \item \texttt{src/evaluate.py} --- metrics, plotting, and feature importance visualisation
+  \item \texttt{src/main.py} --- end-to-end pipeline; generates all figures
+\end{itemize}
+
+% ─────────────────────────────────────────────────────────────────────────────
+\bibliographystyle{plainnat}
+\begin{thebibliography}{9}
+
+\bibitem{weinstein2013}
+Weinstein, J.~N., et al.\ (2013).
+The Cancer Genome Atlas Pan-Cancer analysis project.
+\textit{Nature Genetics}, 45(10), 1113--1120.
+
+\bibitem{hutter2018}
+Hutter, C., \& Zenklusen, J.~C.\ (2018).
+The Cancer Genome Atlas: creating lasting value beyond its data.
+\textit{Cell}, 173(2), 283--285.
+
+\bibitem{cimino2013}
+Cimino-Mathews, A., et al.\ (2013).
+GATA3 expression in breast carcinoma: utility in triple-negative, sarcomatoid,
+and metastatic carcinomas.
+\textit{Human Pathology}, 44(7), 1341--1349.
+
+\end{thebibliography}
+
+\end{document}

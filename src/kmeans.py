@@ -11,52 +11,55 @@ class KMeans:
         self.labels_ = None
         self.inertia_ = None
 
+    def _assign_labels(self, X, centers):
+        """Assign each point to its nearest center."""
+        dists = np.linalg.norm(X[:, np.newaxis] - centers, axis=2)
+        return np.argmin(dists, axis=1)
+
     def fit(self, X):
         if self.random_state is not None:
             np.random.seed(self.random_state)
-            
+
         best_inertia = np.inf
         best_centers = None
         best_labels = None
-        
+
         for _ in range(self.n_init):
             # 1. Initialize centroids randomly from data points
             idx = np.random.choice(X.shape[0], self.n_clusters, replace=False)
             centers = X[idx].copy()
-            
-            for i in range(self.max_iter):
+
+            for _ in range(self.max_iter):
                 # 2. Assignment step
-                # Compute distances from each point to each center
-                # (X - centers)^2 = X^2 - 2*X*centers + centers^2
-                # But simple broadcast is easier for moderate dims
-                # dists: (N, K)
-                dists = np.linalg.norm(X[:, np.newaxis] - centers, axis=2)
-                labels = np.argmin(dists, axis=1)
-                
+                labels = self._assign_labels(X, centers)
+
                 # 3. Update step
-                new_centers = np.array([X[labels == k].mean(axis=0) if np.any(labels == k) else centers[k] 
-                                        for k in range(self.n_clusters)])
-                
+                new_centers = np.array([
+                    X[labels == k].mean(axis=0) if np.any(labels == k) else centers[k]
+                    for k in range(self.n_clusters)
+                ])
+
                 # Check for convergence
                 shift = np.linalg.norm(centers - new_centers)
                 centers = new_centers
-                
+
                 if shift < self.tol:
                     break
-            
-            # Compute inertia (SSE)
-            inertia = np.sum((X - centers[labels])**2)
-            
+
+            # Re-assign labels with final centers before computing inertia
+            # (ensures labels and centers are consistent after the last update step)
+            labels = self._assign_labels(X, centers)
+            inertia = np.sum((X - centers[labels]) ** 2)
+
             if inertia < best_inertia:
                 best_inertia = inertia
-                best_centers = centers
-                best_labels = labels
-        
+                best_centers = centers.copy()
+                best_labels = labels.copy()
+
         self.cluster_centers_ = best_centers
         self.labels_ = best_labels
         self.inertia_ = best_inertia
         return self
 
     def predict(self, X):
-        dists = np.linalg.norm(X[:, np.newaxis] - self.cluster_centers_, axis=2)
-        return np.argmin(dists, axis=1)
+        return self._assign_labels(X, self.cluster_centers_)
