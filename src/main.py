@@ -18,6 +18,7 @@ from datetime import datetime
 from sklearn.model_selection import StratifiedKFold, train_test_split
 from sklearn.preprocessing import LabelEncoder, StandardScaler
 from sklearn.metrics import f1_score, accuracy_score, confusion_matrix
+from sklearn.svm import SVC
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -43,7 +44,7 @@ CANCER_COLORS = {
 def setup_run_directory():
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
     run_dir = os.path.join("results", "runs", f"run_{ts}")
-    for sub in ("logs", "graphs", "models", "analysis"):
+    for sub in ("logs", "graphs", "graphs/new_figures", "models", "analysis"):
         os.makedirs(os.path.join(run_dir, sub), exist_ok=True)
     return run_dir
 
@@ -66,6 +67,11 @@ class Logger:
 def G(run_dir, name):
     """Shorthand: path to graphs/ subfolder."""
     return os.path.join(run_dir, "graphs", name)
+
+
+def NF(run_dir, name):
+    """Shorthand: path to graphs/new_figures/ subfolder."""
+    return os.path.join(run_dir, "graphs", "new_figures", name)
 
 
 def A(run_dir, name):
@@ -244,6 +250,154 @@ def fig_mlp_learning_curves(history, path):
     print(f"Saved: {path}")
 
 
+# ── New extended figures ───────────────────────────────────────────────────────
+
+def fig_decision_boundary(lr_model, mlp_model, X_test_pca, y_test,
+                           class_names, n_classes, path):
+    """
+    LR vs MLP decision regions on the PC1-PC2 plane.
+    All other PCs fixed at 0 (PCA-space mean).
+    """
+    pad = 2.0
+    x1_min = X_test_pca[:, 0].min() - pad
+    x1_max = X_test_pca[:, 0].max() + pad
+    x2_min = X_test_pca[:, 1].min() - pad
+    x2_max = X_test_pca[:, 1].max() + pad
+
+    res = 200
+    xx, yy = np.meshgrid(np.linspace(x1_min, x1_max, res),
+                         np.linspace(x2_min, x2_max, res))
+    n_grid = xx.ravel().shape[0]
+    grid_50d = np.zeros((n_grid, X_test_pca.shape[1]))
+    grid_50d[:, 0] = xx.ravel()
+    grid_50d[:, 1] = yy.ravel()
+
+    # LR predictions
+    z_lr = lr_model.predict(grid_50d).reshape(xx.shape)
+
+    # MLP predictions
+    mlp_model.eval()
+    with torch.no_grad():
+        z_mlp = mlp_model(torch.FloatTensor(grid_50d)).argmax(dim=1).numpy().reshape(xx.shape)
+
+    disagree = (z_lr != z_mlp).astype(float)
+
+    colors_list = [CANCER_COLORS[c] for c in class_names]
+    cmap_cls = matplotlib.colors.ListedColormap(colors_list)
+    levels = np.arange(-0.5, n_classes + 0.5)
+
+    fig, axes = plt.subplots(1, 3, figsize=(21, 6))
+
+    for ax, z, title in [
+        (axes[0], z_lr,  "Logistic Regression"),
+        (axes[1], z_mlp, "MLP [512, 256]"),
+    ]:
+        ax.contourf(xx, yy, z, alpha=0.22, cmap=cmap_cls, levels=levels)
+        for k, cancer in enumerate(class_names):
+            mask = y_test == k
+            ax.scatter(X_test_pca[mask, 0], X_test_pca[mask, 1],
+                       color=CANCER_COLORS[cancer], s=14, alpha=0.75,
+                       label=cancer, linewidths=0, zorder=2)
+        ax.set_xlabel("PC1"); ax.set_ylabel("PC2")
+        ax.set_title(title)
+        ax.legend(title="True Label", fontsize=8, markerscale=1.5,
+                  bbox_to_anchor=(1.01, 1), loc="upper left")
+
+    # Disagreement panel
+    axes[2].pcolormesh(xx, yy, disagree, cmap="RdYlGn_r", alpha=0.45,
+                       vmin=0, vmax=1, shading="auto")
+    for k, cancer in enumerate(class_names):
+        mask = y_test == k
+        axes[2].scatter(X_test_pca[mask, 0], X_test_pca[mask, 1],
+                        color=CANCER_COLORS[cancer], s=14, alpha=0.75,
+                        label=cancer, linewidths=0, zorder=2)
+    axes[2].set_xlabel("PC1"); axes[2].set_ylabel("PC2")
+    axes[2].set_title("Regions Where LR \u2260 MLP (red)")
+    axes[2].legend(title="True Label", fontsize=8, markerscale=1.5,
+                   bbox_to_anchor=(1.01, 1), loc="upper left")
+
+    plt.suptitle(
+        "Decision Boundaries in PC1\u2013PC2 Space  (all other PCs fixed at 0)",
+        fontsize=13)
+    plt.tight_layout()
+    plt.savefig(path, dpi=300, bbox_inches="tight"); plt.close()
+    print(f"Saved: {path}")
+
+
+def fig_perclass_perm_heatmap(perclass_drops, top_pc_indices, class_names, path):
+    """
+    Heatmap: rows = top PCs (sorted by total importance),
+             cols = cancer types,
+             values = macro-F1 drop for that class when that PC is permuted.
+    """
+    pc_labels = [f"PC{i+1}" for i in top_pc_indices]
+
+    fig, ax = plt.subplots(figsize=(11, 5))
+    sns.heatmap(perclass_drops, annot=True, fmt=".3f",
+                xticklabels=class_names,
+                yticklabels=pc_labels,
+                cmap="Reds", linewidths=0.5, ax=ax,
+                cbar_kws={"label": "Per-class F1 drop when permuted"})
+    ax.set_xlabel("Cancer Type")
+    ax.set_ylabel("Principal Component (sorted by total importance)")
+    ax.set_title(
+        "Per-Class Permutation Importance\n"
+        "Which PCs Matter for Which Cancer Type?")
+    plt.tight_layout()
+    plt.savefig(path, dpi=300, bbox_inches="tight"); plt.close()
+    print(f"Saved: {path}")
+
+
+def fig_summary_3models(lr_results, svm_results, mlp_results, path):
+    """Test-set F1/Precision/Recall bar chart for all three models."""
+    metrics = ["Macro F1", "Macro Precision", "Macro Recall"]
+    lr_vals  = [lr_results["F1"],  lr_results["Precision"],  lr_results["Recall"]]
+    svm_vals = [svm_results["F1"], svm_results["Precision"], svm_results["Recall"]]
+    mlp_vals = [mlp_results["F1"], mlp_results["Precision"], mlp_results["Recall"]]
+
+    x = np.arange(3); w = 0.22
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    b1 = ax.bar(x - w,   lr_vals,  w, label="Logistic Regression", color="#3C5488", alpha=0.85)
+    b2 = ax.bar(x,       svm_vals, w, label="RBF-SVM",             color="#F39B7F", alpha=0.85)
+    b3 = ax.bar(x + w,   mlp_vals, w, label="MLP [512, 256]",      color="#E64B35", alpha=0.85)
+
+    for bars, vals in [(b1, lr_vals), (b2, svm_vals), (b3, mlp_vals)]:
+        for b, v in zip(bars, vals):
+            ax.text(b.get_x() + b.get_width() / 2, b.get_height() + 0.0004,
+                    f"{v:.4f}", ha="center", va="bottom", fontsize=8)
+
+    all_vals = lr_vals + svm_vals + mlp_vals
+    ax.set_ylim(max(0.965, min(all_vals) - 0.005), 1.005)
+    ax.set_xticks(x); ax.set_xticklabels(metrics)
+    ax.set_ylabel("Score")
+    ax.set_title("Test Set Performance — LR vs RBF-SVM vs MLP")
+    ax.legend(); ax.grid(axis="y", alpha=0.3)
+    plt.tight_layout()
+    plt.savefig(path, dpi=300, bbox_inches="tight"); plt.close()
+    print(f"Saved: {path}")
+
+
+def fig_cv_folds_3models(lr_folds, svm_folds, mlp_folds, path):
+    """5-fold CV F1 bar chart for all three models."""
+    x = np.arange(5); w = 0.25
+    fig, ax = plt.subplots(figsize=(9, 4.5))
+    ax.bar(x - w,   lr_folds,  w, label="Logistic Regression", color="#3C5488", alpha=0.85)
+    ax.bar(x,       svm_folds, w, label="RBF-SVM",             color="#F39B7F", alpha=0.85)
+    ax.bar(x + w,   mlp_folds, w, label="MLP [512, 256]",      color="#E64B35", alpha=0.85)
+
+    all_folds = lr_folds + svm_folds + mlp_folds
+    ax.set_ylim(max(0, min(all_folds) - 0.01), 1.003)
+    ax.set_xticks(x); ax.set_xticklabels([f"Fold {i+1}" for i in range(5)])
+    ax.set_ylabel("Macro F1 Score")
+    ax.set_title("5-Fold CV Macro F1 — LR vs RBF-SVM vs MLP")
+    ax.legend(); ax.grid(axis="y", alpha=0.3)
+    for folds, color in [(lr_folds, "#3C5488"), (svm_folds, "#F39B7F"), (mlp_folds, "#E64B35")]:
+        ax.axhline(np.mean(folds), color=color, linestyle="--", lw=1, alpha=0.7)
+    plt.tight_layout()
+    plt.savefig(path, dpi=300, bbox_inches="tight"); plt.close()
+    print(f"Saved: {path}")
+
+
 # ── Cross-validation ──────────────────────────────────────────────────────────
 
 def run_lr_cv(X_dev, y_dev, lambdas, n_splits=5, random_state=42):
@@ -298,14 +452,37 @@ def run_mlp_cv(X_dev, y_dev, n_classes, epochs=50, n_splits=5, random_state=42):
             "folds": fold_f1s}
 
 
+def run_svm_cv(X_dev, y_dev, n_splits=5, random_state=42):
+    """5-fold stratified CV for RBF-SVM (preprocessing inside each fold)."""
+    skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=random_state)
+    fold_f1s = []
+
+    for fold_idx, (tr, va) in enumerate(skf.split(X_dev, y_dev)):
+        X_tr, X_va = X_dev[tr], X_dev[va]
+        y_tr, y_va = y_dev[tr], y_dev[va]
+
+        scaler = StandardScaler()
+        X_tr_s = scaler.fit_transform(X_tr)
+        X_va_s = scaler.transform(X_va)
+        pca_fold = PCA(n_components=50)
+        X_tr_p = pca_fold.fit_transform(X_tr_s)
+        X_va_p = pca_fold.transform(X_va_s)
+
+        svm = SVC(kernel="rbf", C=1.0, gamma="scale", random_state=42)
+        svm.fit(X_tr_p, y_tr)
+        fold_f1s.append(f1_score(y_va, svm.predict(X_va_p), average="macro"))
+        print(f"  Fold {fold_idx + 1}/{n_splits}: F1 = {fold_f1s[-1]:.4f}")
+
+    return {"mean": float(np.mean(fold_f1s)), "std": float(np.std(fold_f1s)),
+            "folds": fold_f1s}
+
+
 # ── Feature importance ────────────────────────────────────────────────────────
 
 def compute_lr_gene_weights(lr_model, pca, class_names):
     """Project OvR weights from PCA space back to gene space."""
     weights_per_class = {}
     for cancer, (w, _) in zip(class_names, lr_model.models):
-        # pca.components_ shape: (n_components, n_genes)
-        # gene_weights shape: (n_genes,)
         gene_weights = pca.components.T @ w
         weights_per_class[cancer] = gene_weights
     return weights_per_class
@@ -333,6 +510,35 @@ def compute_permutation_importance(model, X_test_pca, y_test, baseline_f1,
         importances[j] = np.mean(drops)
 
     return importances
+
+
+def compute_perclass_permutation(model, X_test_pca, y_test, n_classes,
+                                  top_pc_indices, n_repeats=3, random_state=42):
+    """
+    Per-class F1 drop when each of the given PC columns is permuted.
+    Returns array of shape (len(top_pc_indices), n_classes).
+    """
+    rng = np.random.default_rng(random_state + 1)  # different seed to avoid correlation
+
+    model.eval()
+    with torch.no_grad():
+        y_pred_base = model(torch.FloatTensor(X_test_pca)).argmax(dim=1).numpy()
+    baseline = np.array([f1_score(y_test == k, y_pred_base == k)
+                         for k in range(n_classes)])
+
+    result = np.zeros((len(top_pc_indices), n_classes))
+    for i, pc_idx in enumerate(top_pc_indices):
+        drops = np.zeros((n_repeats, n_classes))
+        for r in range(n_repeats):
+            X_perm = X_test_pca.copy()
+            rng.shuffle(X_perm[:, pc_idx])
+            with torch.no_grad():
+                y_pred = model(torch.FloatTensor(X_perm)).argmax(dim=1).numpy()
+            drops[r] = baseline - np.array([f1_score(y_test == k, y_pred == k)
+                                            for k in range(n_classes)])
+        result[i] = drops.mean(axis=0)
+
+    return result
 
 
 # ── Main pipeline ─────────────────────────────────────────────────────────────
@@ -516,7 +722,6 @@ def main():
     print(f"\nMLP CV macro-F1: {mlp_cv['mean']:.4f} ± {mlp_cv['std']:.4f}")
 
     # Retrain on full dev set — hold a small internal val slice for curve monitoring
-    # (never use test set here; this val slice is only for the learning-curve plot)
     print("\nRetraining MLP on full development set...")
     X_dev_tr, X_dev_monitor, y_dev_tr, y_dev_monitor = train_test_split(
         X_dev_pca, y_dev, test_size=0.10, random_state=42, stratify=y_dev)
@@ -563,7 +768,69 @@ def main():
                               for i in range(len(perm_scores))},
                    "top10_pcs": [int(i+1) for i in top10_pcs]}, f, indent=2)
 
-    # ── 9. Combined figures ────────────────────────────────────────────────────
+    # ── 9. METHOD 4 — RBF-SVM (5-fold CV) ────────────────────────────────────
+    print("\n" + "=" * 80)
+    print("METHOD 4 — RBF-SVM (5-fold Stratified CV)")
+    print("=" * 80)
+
+    svm_cv = run_svm_cv(X_dev, y_dev)
+    print(f"\nSVM CV macro-F1: {svm_cv['mean']:.4f} ± {svm_cv['std']:.4f}")
+
+    print("\nRetraining RBF-SVM on full development set...")
+    svm_model = SVC(kernel="rbf", C=1.0, gamma="scale", random_state=42)
+    svm_model.fit(X_dev_pca, y_dev)
+
+    y_test_pred_svm = svm_model.predict(X_test_pca)
+    svm_test_results = evaluate.evaluate_classification(
+        y_test, y_test_pred_svm, class_names,
+        title="RBF-SVM (Test Set)",
+        output_path=NF(run_dir, "figN1_svm_confusion.png"))
+
+    print(f"\nSVM vs LR test F1 gap: "
+          f"{(svm_test_results['F1'] - lr_test_results['F1'])*100:+.2f} pp")
+    print(f"MLP vs SVM test F1 gap: "
+          f"{(mlp_test_results['F1'] - svm_test_results['F1'])*100:+.2f} pp")
+
+    with open(os.path.join(run_dir, "models", "svm_model.pkl"), "wb") as f:
+        pickle.dump(svm_model, f)
+
+    # ── 10. NEW FIGURES (new_figures/ subfolder) ───────────────────────────────
+    print("\n" + "=" * 80)
+    print("GENERATING NEW ANALYSIS FIGURES")
+    print("=" * 80)
+
+    # 4A — Decision boundary on PC1-PC2
+    print("\nGenerating decision boundary figure...")
+    y_test_names = le.inverse_transform(y_test)
+    fig_decision_boundary(
+        lr_model, mlp_model, X_test_pca, y_test,
+        class_names, n_classes,
+        NF(run_dir, "figN2_decision_boundary.png"))
+
+    # 4C — Per-class permutation importance heatmap (top 8 PCs)
+    print("\nComputing per-class permutation importance (top 8 PCs)...")
+    top8_pcs = np.argsort(perm_scores)[::-1][:8]
+    perclass_drops = compute_perclass_permutation(
+        mlp_model, X_test_pca, y_test, n_classes, top8_pcs, n_repeats=3)
+    fig_perclass_perm_heatmap(
+        perclass_drops, top8_pcs, class_names,
+        NF(run_dir, "figN3_perclass_perm_heatmap.png"))
+
+    with open(A(run_dir, "mlp_perclass_permutation.json"), "w") as f:
+        json.dump({f"PC{top8_pcs[i]+1}": {class_names[k]: float(perclass_drops[i, k])
+                                           for k in range(n_classes)}
+                   for i in range(len(top8_pcs))}, f, indent=2)
+
+    # 3-model summary comparison
+    fig_summary_3models(lr_test_results, svm_test_results, mlp_test_results,
+                        NF(run_dir, "figN4_summary_3models.png"))
+
+    # 3-model CV folds
+    fig_cv_folds_3models(
+        lr_cv[best_lambda]["folds"], svm_cv["folds"], mlp_cv["folds"],
+        NF(run_dir, "figN5_cv_folds_3models.png"))
+
+    # ── 11. Combined figures ───────────────────────────────────────────────────
     print("\n" + "=" * 80)
     print("GENERATING COMBINED FIGURES")
     print("=" * 80)
@@ -578,7 +845,7 @@ def main():
     fig_summary_comparison(lr_test_results, mlp_test_results,
                            G(run_dir, "fig_summary_comparison.png"))
 
-    # ── 10. Save consolidated results ─────────────────────────────────────────
+    # ── 12. Save consolidated results ─────────────────────────────────────────
     final = {
         "clustering": {**clustering_results, "inertia": kmeans.inertia_},
         "lr": {
@@ -590,6 +857,14 @@ def main():
             "test_precision": lr_test_results["Precision"],
             "test_recall": lr_test_results["Recall"],
             "cv_all_lambdas": {str(l): lr_cv[l] for l in lambdas},
+        },
+        "svm": {
+            "cv_f1_mean": svm_cv["mean"],
+            "cv_f1_std": svm_cv["std"],
+            "cv_fold_f1s": svm_cv["folds"],
+            "test_f1": svm_test_results["F1"],
+            "test_precision": svm_test_results["Precision"],
+            "test_recall": svm_test_results["Recall"],
         },
         "mlp": {
             "cv_f1_mean": mlp_cv["mean"],
@@ -609,7 +884,7 @@ def main():
     with open(A(run_dir, "final_results.json"), "w") as f:
         json.dump(final, f, indent=2)
 
-    # ── 11. Print final summary ────────────────────────────────────────────────
+    # ── 13. Print final summary ────────────────────────────────────────────────
     print("\n" + "=" * 80)
     print("FINAL RESULTS SUMMARY")
     print("=" * 80)
@@ -624,14 +899,21 @@ def main():
           f"Precision: {lr_test_results['Precision']:.4f}  "
           f"Recall: {lr_test_results['Recall']:.4f}")
 
-    print(f"\nMethod 3 — MLP [512, 256]")
+    print(f"\nMethod 3 — RBF-SVM")
+    print(f"  5-fold CV F1: {svm_cv['mean']:.4f} ± {svm_cv['std']:.4f}")
+    print(f"  Test F1: {svm_test_results['F1']:.4f}  "
+          f"Precision: {svm_test_results['Precision']:.4f}  "
+          f"Recall: {svm_test_results['Recall']:.4f}")
+
+    print(f"\nMethod 4 — MLP [512, 256]")
     print(f"  5-fold CV F1: {mlp_cv['mean']:.4f} ± {mlp_cv['std']:.4f}")
     print(f"  Test F1: {mlp_test_results['F1']:.4f}  "
           f"Precision: {mlp_test_results['Precision']:.4f}  "
           f"Recall: {mlp_test_results['Recall']:.4f}")
 
-    print(f"\nMLP vs LR test F1 gap: "
-          f"{(mlp_test_results['F1'] - lr_test_results['F1'])*100:+.2f} pp")
+    print(f"\nMLP vs LR test F1 gap:  {(mlp_test_results['F1'] - lr_test_results['F1'])*100:+.2f} pp")
+    print(f"MLP vs SVM test F1 gap: {(mlp_test_results['F1'] - svm_test_results['F1'])*100:+.2f} pp")
+    print(f"SVM vs LR test F1 gap:  {(svm_test_results['F1'] - lr_test_results['F1'])*100:+.2f} pp")
 
     print(f"\nAll results saved to: {run_dir}")
     print("=" * 80)
