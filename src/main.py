@@ -3,9 +3,13 @@ Cancer Subtype Discovery Pipeline
 TCGA Pan-Cancer RNA-seq | BRCA / LUAD / KIRC / PRAD / COAD / GBM
 
 Generates all figures and analysis into a timestamped run directory.
+
+Usage:
+    python src/main.py              # default seed=42
+    python src/main.py --seed 7     # custom seed
 """
 
-import os, sys, json, pickle
+import os, sys, json, pickle, argparse
 import numpy as np
 import pandas as pd
 import torch
@@ -41,9 +45,9 @@ CANCER_COLORS = {
 
 # ── Infrastructure ────────────────────────────────────────────────────────────
 
-def setup_run_directory():
+def setup_run_directory(seed=42):
     ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    run_dir = os.path.join("results", "runs", f"run_{ts}")
+    run_dir = os.path.join("results", "runs", f"run_{ts}_seed{seed}")
     for sub in ("logs", "graphs", "graphs/new_figures", "models", "analysis"):
         os.makedirs(os.path.join(run_dir, sub), exist_ok=True)
     return run_dir
@@ -81,9 +85,9 @@ def A(run_dir, name):
 
 # ── Data helpers ──────────────────────────────────────────────────────────────
 
-def holdout_split(X, y, test_size=0.15, random_state=42):
+def holdout_split(X, y, test_size=0.15, seed=42):
     return train_test_split(X, y, test_size=test_size,
-                            random_state=random_state, stratify=y)
+                            random_state=seed, stratify=y)
 
 
 def detect_overfitting(train_acc, val_acc, model_name):
@@ -543,15 +547,30 @@ def compute_perclass_permutation(model, X_test_pca, y_test, n_classes,
 
 # ── Main pipeline ─────────────────────────────────────────────────────────────
 
-def main():
+def run_pipeline(seed=42, log_to_file=True):
+    """
+    Full end-to-end pipeline. Returns the final results dict.
+
+    Parameters
+    ----------
+    seed : int
+        Controls train/test split, CV fold assignment, K-Means restarts,
+        LR gradient descent, SVM, and MLP weight initialisation.
+    log_to_file : bool
+        If True, redirect stdout to a log file inside the run directory.
+        Set False when calling from multi_seed_experiment to keep terminal output.
+    """
     print("=" * 80)
     print("CANCER SUBTYPE DISCOVERY PIPELINE")
     print("TCGA Pan-Cancer RNA-seq | BRCA / LUAD / KIRC / PRAD / COAD / GBM")
+    print(f"SEED: {seed}")
     print("=" * 80)
     print(f"Run started: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
-    run_dir = setup_run_directory()
-    sys.stdout = Logger(os.path.join(run_dir, "logs", "training_log.txt"))
+    run_dir = setup_run_directory(seed)
+    _original_stdout = sys.stdout
+    if log_to_file:
+        sys.stdout = Logger(os.path.join(run_dir, "logs", "training_log.txt"))
     print(f"Run directory: {run_dir}")
 
     # ── 1. Load data ──────────────────────────────────────────────────────────
@@ -586,7 +605,7 @@ def main():
     print("STEP 2 — TRAIN / TEST SPLIT (85% dev / 15% test, stratified)")
     print("=" * 80)
 
-    X_dev, X_test, y_dev, y_test = holdout_split(X, y, test_size=0.15)
+    X_dev, X_test, y_dev, y_test = holdout_split(X, y, test_size=0.15, seed=seed)
     print(f"Development: {len(X_dev)} samples  |  Test (held-out): {len(X_test)} samples")
 
     with open(A(run_dir, "data_split.json"), "w") as f:
@@ -628,7 +647,7 @@ def main():
     print("METHOD 1 — PCA + K-Means (Unsupervised Discovery)")
     print("=" * 80)
 
-    kmeans = KMeans(n_clusters=n_classes, random_state=42)
+    kmeans = KMeans(n_clusters=n_classes, random_state=seed)
     kmeans.fit(X_dev_pca)
     print(f"KMeans | Inertia: {kmeans.inertia_:.2f}")
 
@@ -660,7 +679,7 @@ def main():
     print("=" * 80)
 
     lambdas = [0.001, 0.01, 0.1]
-    lr_cv = run_lr_cv(X_dev, y_dev, lambdas)
+    lr_cv = run_lr_cv(X_dev, y_dev, lambdas, random_state=seed)
 
     print("\nCV macro-F1:")
     best_lambda, best_f1 = max(
@@ -670,7 +689,7 @@ def main():
         print(f"  L2={l}: {lr_cv[l]['mean']:.4f} ± {lr_cv[l]['std']:.4f}{marker}")
 
     # Retrain on full dev set with shared preprocessing
-    np.random.seed(42)
+    np.random.seed(seed)
     print(f"\nRetraining LR (L2={best_lambda}) on full development set...")
     lr_model = LogisticRegressionOvR(lr=0.1, l2_lambda=best_lambda, n_iters=1000)
     lr_model.fit(X_dev_pca, y_dev)
@@ -717,15 +736,15 @@ def main():
     print("METHOD 3 — MLP (5-fold Stratified CV)")
     print("=" * 80)
 
-    torch.manual_seed(42)
-    mlp_cv = run_mlp_cv(X_dev, y_dev, n_classes, epochs=50)
+    torch.manual_seed(seed)
+    mlp_cv = run_mlp_cv(X_dev, y_dev, n_classes, epochs=50, random_state=seed)
     print(f"\nMLP CV macro-F1: {mlp_cv['mean']:.4f} ± {mlp_cv['std']:.4f}")
 
     # Retrain on full dev set — hold a small internal val slice for curve monitoring
     print("\nRetraining MLP on full development set...")
     X_dev_tr, X_dev_monitor, y_dev_tr, y_dev_monitor = train_test_split(
-        X_dev_pca, y_dev, test_size=0.10, random_state=42, stratify=y_dev)
-    torch.manual_seed(42)
+        X_dev_pca, y_dev, test_size=0.10, random_state=seed, stratify=y_dev)
+    torch.manual_seed(seed)
     mlp_model, history = train_mlp(X_dev_tr, y_dev_tr, X_dev_monitor, y_dev_monitor,
                                    n_classes, epochs=50)
 
@@ -753,7 +772,7 @@ def main():
 
     baseline_f1 = mlp_test_results["F1"]
     perm_scores = compute_permutation_importance(
-        mlp_model, X_test_pca, y_test, baseline_f1, n_repeats=3)
+        mlp_model, X_test_pca, y_test, baseline_f1, n_repeats=3, random_state=seed)
 
     evaluate.plot_permutation_importance(
         perm_scores, output_path=G(run_dir, "fig13_mlp_permutation_importance.png"))
@@ -773,11 +792,11 @@ def main():
     print("METHOD 4 — RBF-SVM (5-fold Stratified CV)")
     print("=" * 80)
 
-    svm_cv = run_svm_cv(X_dev, y_dev)
+    svm_cv = run_svm_cv(X_dev, y_dev, random_state=seed)
     print(f"\nSVM CV macro-F1: {svm_cv['mean']:.4f} ± {svm_cv['std']:.4f}")
 
     print("\nRetraining RBF-SVM on full development set...")
-    svm_model = SVC(kernel="rbf", C=1.0, gamma="scale", random_state=42)
+    svm_model = SVC(kernel="rbf", C=1.0, gamma="scale", random_state=seed)
     svm_model.fit(X_dev_pca, y_dev)
 
     y_test_pred_svm = svm_model.predict(X_test_pca)
@@ -811,7 +830,8 @@ def main():
     print("\nComputing per-class permutation importance (top 8 PCs)...")
     top8_pcs = np.argsort(perm_scores)[::-1][:8]
     perclass_drops = compute_perclass_permutation(
-        mlp_model, X_test_pca, y_test, n_classes, top8_pcs, n_repeats=3)
+        mlp_model, X_test_pca, y_test, n_classes, top8_pcs, n_repeats=3,
+        random_state=seed + 1)
     fig_perclass_perm_heatmap(
         perclass_drops, top8_pcs, class_names,
         NF(run_dir, "figN3_perclass_perm_heatmap.png"))
@@ -879,8 +899,19 @@ def main():
             "mlp_top10_pcs": [int(i+1) for i in top10_pcs],
         },
         "run_dir": run_dir,
+        "seed": seed,
+        "class_names": list(class_names),
         "timestamp": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
     }
+
+    # Per-class F1 on test set (added for multi-seed aggregate analysis)
+    from sklearn.metrics import f1_score as _f1
+    final["lr"]["per_class_f1"]  = [float(_f1(y_test == k, y_test_pred_lr  == k))
+                                     for k in range(n_classes)]
+    final["svm"]["per_class_f1"] = [float(_f1(y_test == k, y_test_pred_svm == k))
+                                     for k in range(n_classes)]
+    final["mlp"]["per_class_f1"] = [float(_f1(y_test == k, y_test_pred_mlp == k))
+                                     for k in range(n_classes)]
     with open(A(run_dir, "final_results.json"), "w") as f:
         json.dump(final, f, indent=2)
 
@@ -919,6 +950,19 @@ def main():
     print("=" * 80)
     print("PIPELINE COMPLETED SUCCESSFULLY")
     print("=" * 80)
+
+    if log_to_file:
+        sys.stdout = _original_stdout
+
+    return final
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Cancer subtype discovery pipeline")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for split, CV, and model init (default: 42)")
+    args = parser.parse_args()
+    run_pipeline(seed=args.seed, log_to_file=True)
 
 
 if __name__ == "__main__":
